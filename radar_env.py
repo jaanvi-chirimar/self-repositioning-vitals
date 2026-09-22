@@ -1,7 +1,7 @@
 import numpy as np
 from gymnasium import Env, spaces
 from geometry import (distance_and_angle, aspect_angle, reward as compute_reward,
-                      predicted_band_snr, MIN_CENTER_DISTANCE)
+                      predicted_band_snr, link_budget_db, MIN_CENTER_DISTANCE)
 
 # --- sensor model ---------------------------------------------------------
 # The robot does NOT read simulator state. It reads two sensors, each of
@@ -24,12 +24,17 @@ LIDAR_RANGE_NOISE = 0.02     # m, 1 sigma
 LIDAR_BEARING_NOISE_DEG = 1.0
 LIDAR_PHI_NOISE_DEG = 10.0   # phi estimation is the unreliable one
 
-# The radar returns a usable SNR only when there IS one. This falls straight
-# out of the link budget already in geometry.snr_db() -- too far, too far
-# off-boresight, or too side-on, and there is simply no reading to report.
+# The radar reports cardiac_band_snr (mmResp/cardiac_quality.py) -- pre-CNN,
+# computed straight from the phase at the peak range bin, so it is something
+# the real robot can actually read live. It is only reported when the radar
+# has a target at all: too far, too far off-boresight, or too side-on and the
+# link budget drops below RADAR_SNR_FLOOR_DB and there is no peak bin to read.
+#
+# Noise is the measured spread: repeat captures of the same pose vary by
+# std ~3-6 on a median of ~10-13 (table_a_cardiac.csv), i.e. ~2 dB.
 RADAR_SNR_FLOOR_DB = -20.0
-RADAR_SNR_NOISE_DB = 1.5
-SNR_OBS_SCALE = 20.0         # keeps the dB value in roughly [-3, 1] for the net
+RADAR_SNR_NOISE_DB = 2.0
+SNR_OBS_SCALE = 20.0         # keeps the dB value in roughly [0, 1] for the net
 
 # --- actuator limits ------------------------------------------------------
 # "Not to have it jerk around", as a CONSTRAINT rather than a preference.
@@ -123,18 +128,10 @@ class RadarPoseEnv(Env):
         a_obs = (a + self.np_random.normal(0.0, np.radians(LIDAR_PHI_NOISE_DEG))
                  if phi_ok else 0.0)
 
-        # OPEN QUESTION -- this channel does not yet correspond to anything
-        # the real robot could read, and all three candidates were ruled out
-        # (2026-09-21):
-        #   cnn_band_snr      needs CNN inference, 16-28s per reading
-        #   bulk snr_db       WRONG SIGN within the FOV (spearman +0.17)
-        #   phase_band_snr    weak (-0.33) and its distance trend is inverted
-        # For now it reports the model's own predicted band_snr in dB, which
-        # is at least a real quantity -- but it is not measurable live, so it
-        # must be resolved before any hardware transfer.
-        true_band_snr = predicted_band_snr(max(d, 1e-3), np.degrees(b), np.degrees(a))
-        true_snr = 10.0 * np.log10(max(true_band_snr, 1e-6))
-        snr_ok = true_snr >= RADAR_SNR_FLOOR_DB
+        # cardiac_band_snr in dB. Not modelled yet: the real reading needs a
+        # 10s+ window, so on hardware it lags the pose by several seconds.
+        snr_ok = link_budget_db(max(d, 1e-3), np.degrees(b)) >= RADAR_SNR_FLOOR_DB
+        true_snr = 10.0 * np.log10(predicted_band_snr(max(d, 1e-3), np.degrees(b), np.degrees(a)))
         snr_obs = (true_snr + self.np_random.normal(0.0, RADAR_SNR_NOISE_DB)
                    if snr_ok else 0.0)
 

@@ -20,12 +20,10 @@ env = DummyVecEnv([lambda: Monitor(RadarPoseEnv())])
 env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0)
 
 model = PPO("MlpPolicy", env, verbose=1, tensorboard_log="./tb/")
-# 500k was enough while the drive responded instantly, but rate-limited
-# actuators make this a second-order control problem -- commands take ~5 steps
-# to take effect, so the policy has to anticipate rather than react. At 500k
-# the learning curve was still climbing steeply (-11400 -> -698 and rising),
-# i.e. cut off mid-improvement rather than converged.
-model.learn(total_timesteps=2_000_000, progress_bar=True)
+# Back to 500k (2026-09-21). With rate-limited actuators the learning curve
+# plateaus by ~300k: the 2M run on the cardiac reward sat flat (+-10%) from
+# 300k to 2M. The extra 1.5M steps were just noise, at 4x the wall time.
+model.learn(total_timesteps=500_000, progress_bar=True)
 model.save("ppo_radar")
 
 # The running mean/var must be reloaded at eval time or the policy sees

@@ -50,7 +50,7 @@ MAX_STANDOFF = 1.0     # upper bound on center distance (m)
 MIN_CENTER_DISTANCE = MIN_STANDOFF + ROBOT_RADIUS + PERSON_RADIUS
 
 
-# --- Q(distance, theta, phi) = Q_SCALE x quality(snr_db(distance, theta, phi)) ---
+# --- Q(distance, theta, phi) = floor + span x quality(link_budget_db(distance, theta, phi)) ---
 #
 # Two steps, replacing the old factorized TableA x TableB lookup (2026-09-20):
 #
@@ -76,13 +76,21 @@ MIN_CENTER_DISTANCE = MIN_STANDOFF + ROBOT_RADIUS + PERSON_RADIUS
 # anywhere in this model -- it is held out purely as an independent check
 # (see check_against_error() at the bottom of this file).
 
-# Table A: distance(m) -> band_snr, averaged over posture (sit/stand) since
-# the sim doesn't model posture. Only 0.7m/0.9m were captured within the
-# CNN's trained/validated range (<=1m, see MAX_STANDOFF) -- 1.2m trials were
-# excluded on scope, not noise, grounds.
+# Table A: distance(m) -> cardiac_band_snr (mmResp/table_a_cardiac.csv),
+# median per cell, averaged over posture (sit/stand) since the sim doesn't
+# model posture. cardiac_band_snr is the PRE-CNN metric (mmResp/
+# cardiac_quality.py): phase difference at the peak range bin, averaged over
+# the 8 virtual antennas, bandpassed 45-150 bpm, peak/median in that band.
+# Re-anchored from cnn_band_snr 2026-09-21 -- cnn_band_snr needs the CNN to
+# run first and is circular with the CNN's own error.
+#
+# 0.9m is deliberately NOT an anchor: sit and stand disagree wildly there
+# (12.54 vs 21.76, std ~6 each) so the mean means nothing. It is kept as a
+# held-out check instead -- the fit below predicts 12.47 for it, vs 12.54
+# measured sitting.
 _TABLE_A = {
-    0.7: (25.745 + 24.759) / 2,   # 25.252
-    0.9: (26.657 + 17.518) / 2,   # 22.088
+    0.7: (13.058 + 13.118) / 2,   # 13.088
+    1.2: (10.287 + 10.247) / 2,   # 10.267
 }
 
 # Table B USED to be a measured (theta, phi) -> band_snr lookup (the values
@@ -146,24 +154,48 @@ THETA_LOSS_EXPONENT = 4.0  # how flat the shoulder stays before it bends
 # is absent no matter how strong the bulk reflection is.
 ASPECT_FLOOR = 1e-3    # keeps cos^2 -> 0 from becoming -inf dB at exactly +-90
 
-# Reference point for the whole SNR scale: the closest real measurement in
-# Table A, at boresight with the subject facing the sensor. band_snr is a
+# Chest vs back is NOT symmetric in the data: phi=0 reads 12.26, phi=180
+# reads 11.19 (table_b_cardiac.csv, both theta=0) -- 0.4 dB in the chest's
+# favour. Unlike every other angle comparison, this one is NOT session-
+# confounded: toward_sensor and facing_back were both captured in folders
+# 6-7. Applied smoothly, 0 at the chest rising to the full loss at the back.
+BACK_LOSS_DB = 10.0 * np.log10(12.263 / 11.189)   # ~0.40 dB
+
+
+# Reference point for the link budget's units: the closest real measurement
+# in Table A, at boresight with the subject facing the sensor. band_snr is a
 # power ratio (peak/median), so 10*log10 is the right conversion to dB.
 SNR_REF_DISTANCE = 0.7
-SNR_REF_DB = 10.0 * np.log10(_TABLE_A[SNR_REF_DISTANCE])   # ~14.0 dB
-Q_SCALE = _TABLE_A[SNR_REF_DISTANCE]   # keeps Q in the same units as the old tables
+SNR_REF_DB = 10.0 * np.log10(_TABLE_A[SNR_REF_DISTANCE])   # ~11.2 dB
+
+# cardiac_band_snr does NOT go to zero with no signal. peak/median of a
+# spectrum that is pure noise is still > 1 -- run on white phase noise
+# (8 antennas, 16-30s) it reads 5.3 median. So the metric lives between this
+# floor and a saturation peak, and the prediction is
+#     floor + (peak - floor) * quality(link budget).
+# The floor is MEASURED (noise simulation), not fit. Blind-spot captures read
+# 8-9.5, a little above it -- the known false-peak behaviour at +-90deg, and
+# not something the model should chase.
+CARDIAC_NOISE_FLOOR = 5.3
 
 # The saturating detection curve. QUALITY_HALF_DB is where quality passes
-# 50%; QUALITY_WIDTH_DB sets how sharp the transition is. Calibrated against
-# the SNR data alone -- specifically, to reproduce the measured 0.7m -> 0.9m
-# drop (25.25 -> 22.09, a 14% fall over 4.36 dB of range loss). That the
-# system is still visibly range-sensitive across those two points is what
-# fixes the knee: it says 0.7-0.9m sits on the SLOPE, not out on the plateau.
-QUALITY_HALF_DB = 4.8
+# 50%; QUALITY_WIDTH_DB sets how sharp the transition is. WIDTH is held at
+# the previous value; PEAK and HALF are solved exactly from the two Table A
+# anchors (0.7m -> 13.09, 1.2m -> 10.27). Two points, two free parameters,
+# nothing fit to angle data or to error.
 QUALITY_WIDTH_DB = 3.0
+QUALITY_HALF_DB = 0.323
+CARDIAC_PEAK = 13.298
+Q_SPAN = CARDIAC_PEAK - CARDIAC_NOISE_FLOOR   # ~8.0, the usable range
+
+# The penalty weights below were tuned against the old 0-25.25 Q range. The
+# new metric only spans ~8, so they are rescaled by the same factor to keep
+# every term's weight RELATIVE to the signal exactly as it was -- otherwise
+# the phi dead-zone penalty alone (12) would outweigh the whole signal.
+_PENALTY_UNIT = Q_SPAN / 25.252
 
 FOV_GATE_DEG = 60.0            # |theta| beyond this -> no trusted reading
-COLLISION_PENALTY_SCALE = 200.0  # per meter crossed past the safe-zone floor
+COLLISION_PENALTY_SCALE = 200.0 * _PENALTY_UNIT  # per meter crossed past the safe-zone floor
 
 # Past the measured range there's no real data. Rather than invent a decay
 # shape, the extrapolation follows the radar range equation: received power
@@ -172,8 +204,8 @@ COLLISION_PENALTY_SCALE = 200.0  # per meter crossed past the safe-zone floor
 # Approved by Raja (2026-09-20) as the basis for synthetic far-range data,
 # with one real validation set to be collected later for the paper.
 #
-# Caveat worth keeping in mind: cnn_band_snr is NOT raw received power --
-# it's spectral peakiness of the CNN's output waveform, so R^-4 is the
+# Caveat worth keeping in mind: cardiac_band_snr is NOT raw received power --
+# it's spectral peakiness of the cardiac-band phase signal, so R^-4 is the
 # right *shape* to borrow from physics, not a first-principles derivation
 # of this particular metric. Still far better grounded than the flat
 # per-meter slope this replaced.
@@ -201,8 +233,17 @@ COLLISION_PENALTY_SCALE = 200.0  # per meter crossed past the safe-zone floor
 # ~-2200 in the same batch). The cap keeps the steep near-gate growth
 # (needed to fix the 70deg bug) while bounding the worst case to something
 # comparable to the rest of the reward's scale.
-FOV_PENALTY_SCALE = 500.0    # per radian^2 beyond the FOV gate
-FOV_PENALTY_CAP = 150.0      # max FOV penalty, however far past the gate
+FOV_PENALTY_SCALE = 500.0 * _PENALTY_UNIT    # per radian^2 beyond the FOV gate
+# Capped at ONE signal's worth (Q_SPAN), 2026-09-21. It used to be 150
+# (~6x the whole signal after rescaling), which made orbiting a loss: a diff
+# drive going AROUND the person has them at ~90deg bearing, so every orbit
+# spends ~45 steps outside the gate. Hand-flown from the side dead zone to
+# the front at 0.85m, orbiting scored 290 vs 301 for just parking side-on --
+# so the policy parked, and 19/40 episodes ended in the dead zone, i.e.
+# phi was left entirely to where it happened to arrive. With the cap at
+# Q_SPAN the same orbit scores 1622 vs 301. Losing the reading is the real
+# cost of facing away; this cap charges exactly that and no more.
+FOV_PENALTY_CAP = Q_SPAN
 
 # phi has a different shape than theta: theta is one contiguous valid band
 # (a cone in front of the radar), but phi has TWO valid islands (frontal,
@@ -219,7 +260,9 @@ FOV_PENALTY_CAP = 150.0      # max FOV penalty, however far past the gate
 # roughly with cos(phi): sin^2 = 1 - cos^2 is exactly the lost-radial-
 # motion term. Soft, not a hard reject, for the same reason the FOV gate
 # is soft: a hard cutoff leaves no gradient for the policy to climb out on.
-PHI_DEADZONE_SCALE = 12.0    # penalty at phi=+-90 (peak); 0 at phi=0/180
+#
+# REMOVED 2026-09-21: phi now enters predicted_band_snr() directly, after
+# saturation, which makes this separate penalty redundant (see there).
 
 
 def _angle_diff_deg(a_deg, b_deg):
@@ -243,10 +286,11 @@ def _aspect_loss_db(phi_deg):
     0dB facing or backing the sensor, falling away to the side-on dead
     zone. Floored at ASPECT_FLOOR so exactly +-90 doesn't give -inf."""
     projection = max(np.cos(np.radians(phi_deg)) ** 2, ASPECT_FLOOR)
-    return 10.0 * np.log10(projection)
+    back = BACK_LOSS_DB * (1.0 - np.cos(np.radians(phi_deg))) / 2.0
+    return 10.0 * np.log10(projection) - back
 
 
-def link_budget_db(distance, theta_deg, phi_deg):
+def link_budget_db(distance, theta_deg):
     """INTERNAL physics only -- not a quantity anything outside this module
     should consume. See predicted_band_snr() for the metric that crosses
     interfaces.
@@ -262,10 +306,7 @@ def link_budget_db(distance, theta_deg, phi_deg):
     surface, not its absolute level -- which is what keeps the reward model-
     agnostic: nothing here is fit to a particular estimator's output."""
     range_loss = -40.0 * np.log10(distance / SNR_REF_DISTANCE)
-    return (SNR_REF_DB
-            + range_loss
-            + _theta_loss_db(theta_deg)
-            + _aspect_loss_db(phi_deg))
+    return SNR_REF_DB + range_loss + _theta_loss_db(theta_deg)
 
 
 def quality(snr):
@@ -282,34 +323,37 @@ def quality(snr):
 
 
 def predicted_band_snr(distance, theta_deg, phi_deg):
-    """Predicted cnn_band_snr for this pose -- THE quantity this project
+    """Predicted cardiac_band_snr for this pose -- THE quantity this project
     optimises and the only one that should cross a module boundary.
 
-    band_snr is the hand-crafted metric: spectral peak-to-median power of the
-    estimator's output in the cardiac band. It is NOT received power, and it
-    demonstrably does not scale like it -- measured 0.7m -> 0.9m it falls only
-    -0.58 dB where R^-4 predicts -4.37 dB, i.e. about 7x more gently. That
-    compression is expected of a peak/median ratio with a nonlinear estimator
-    in the path, and it is exactly what quality() encodes: the link budget
-    supplies the physics, this curve maps it onto the measured metric.
+    cardiac_band_snr is pre-CNN (mmResp/cardiac_quality.py): spectral
+    peak-to-median power of the cardiac-band phase signal. It is NOT
+    received power and does not scale like it -- 0.7m -> 1.2m it falls
+    -1.06 dB where R^-4 predicts -9.36 dB. That compression is what the
+    floor + saturating quality() curve encodes: the link budget supplies
+    the physics, the curve maps it onto the measured metric.
 
-    Calibrated against both real points: returns 24.14 at 0.7m and 21.08 at
-    0.9m, versus measured 25.25 and 22.09.
-
-    NOT floored here. band_snr cannot physically read below ~1 (a flat
-    spectrum has peak == median), and the radar channel in radar_env.py does
-    apply that floor -- but the REWARD deliberately keeps sloping below it.
-    A floored reward would go flat everywhere past ~2.1m, which is inside the
-    spawn range, and a flat reward region is the exact condition that made
-    earlier versions of this policy drive away instead of approaching. The
-    reward is a shaping signal; only the observation claims to be a reading.
+    Returns 13.09 at 0.7m and 10.27 at 1.2m (the two anchors), 12.47 at
+    0.9m (held out; 12.54 measured sitting), and approaches the 5.3 noise
+    floor past ~2.5m or in the blind spots.
     """
-    return Q_SCALE * quality(link_budget_db(distance, theta_deg, phi_deg))
+    # phi is applied AFTER the saturation curve, as a fraction of the usable
+    # signal, not inside the link budget (changed 2026-09-21). Side-on, the
+    # chest's motion is tangential: the heartbeat MODULATION is missing, and
+    # no amount of close-range margin brings it back. Inside the link budget
+    # it was absorbed by that margin -- at 0.64m, phi=62deg still predicted
+    # 12.3 of 13.2 -- so parking side-on was optimal and 19/40 episodes did.
+    # (A big additive side-on penalty was tried instead and made the policy
+    # drive away: it charged for phi even far out, where there is no signal
+    # to lose, and that noise swamped the learning signal.)
+    aspect = 10.0 ** (_aspect_loss_db(phi_deg) / 10.0)
+    return CARDIAC_NOISE_FLOOR + Q_SPAN * quality(
+        link_budget_db(distance, theta_deg)) * aspect
 
 
 def reward(distance, bearing, aspect):
     """
-    Score how good this pose is for sensing: Q = Q_SCALE x quality(snr_db),
+    Score how good this pose is for sensing: Q = predicted cardiac_band_snr,
     minus penalties for crossing the collision safe-zone, the FOV gate, or
     phi's side dead-zone (phi near +-90). Higher = better. theta = bearing,
     phi = aspect, both in radians.
@@ -317,7 +361,7 @@ def reward(distance, bearing, aspect):
     Nothing clamps anywhere -- Q rolls off smoothly along the SNR curve in
     every direction, and instead of a hard FOV cutoff a continuous penalty
     is subtracted for how far outside the gate theta is. Same soft-penalty
-    treatment for phi's dead-zone (see PHI_DEADZONE_SCALE).
+    treatment is NOT used for phi -- see predicted_band_snr().
 
     The additive penalties are deliberately kept alongside the multiplicative
     Q: where quality saturates toward 0 (deep in the dead zone, far past the
@@ -334,9 +378,7 @@ def reward(distance, bearing, aspect):
     too_wide = max(0.0, abs(bearing) - np.radians(FOV_GATE_DEG))
     fov_penalty = min(FOV_PENALTY_SCALE * too_wide ** 2, FOV_PENALTY_CAP)
 
-    phi_deadzone_penalty = PHI_DEADZONE_SCALE * np.sin(aspect) ** 2
-
-    return q - collision_penalty - fov_penalty - phi_deadzone_penalty
+    return q - collision_penalty - fov_penalty
 
 
 ANGLE_TRIAL_DISTANCE = 0.6   # the angle captures were all at ~0.6m
