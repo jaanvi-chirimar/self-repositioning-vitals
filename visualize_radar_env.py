@@ -44,6 +44,19 @@ def make_front_marker(x, y, phi):
     )
 
 
+def make_obstacles(obstacles):
+    """Grey pillars for the env's obstacles. They block the LiDAR and the
+    radar, so the person can go completely unseen behind one."""
+    ids = []
+    for ox, oy, r in obstacles:
+        visual = p.createVisualShape(
+            p.GEOM_CYLINDER, radius=r, length=1.2, rgbaColor=[0.35, 0.35, 0.38, 1.0]
+        )
+        ids.append(p.createMultiBody(
+            baseMass=0, baseVisualShapeIndex=visual, basePosition=[ox, oy, 0.6]))
+    return ids
+
+
 def load_obs_normalizer():
     """Training runs under VecNormalize, so the policy learned on scaled
     observations. Replaying without the same statistics feeds it inputs on a
@@ -79,6 +92,7 @@ def main(use_shield=True, turn=None):
     robot_id = p.loadURDF("r2d2.urdf", [env.robot_x, env.robot_y, 0.3])
     make_person_marker(env.person_x, env.person_y)
     front_id = make_front_marker(env.person_x, env.person_y, env.person_phi)
+    make_obstacles(getattr(env, "obstacles", []))
     phi0 = env.person_phi
 
     terminated = truncated = False
@@ -102,6 +116,8 @@ def main(use_shield=True, turn=None):
         if step % 10 == 0:
             d, b, a = env._true_state()
             seen = f"{obs[4]:.0f}{obs[5]:.0f}{obs[6]:.0f}"
+            if obs[4] < 0.5:
+                seen += " PERSON UNSEEN"
             print(f"step {step:3d}  d={d:.2f}  bearing={np.degrees(b):6.1f}  "
                   f"phi={np.degrees(a):7.1f}  reward={reward:7.2f}  "
                   f"channels={seen}" + ("  [HOLD]" if holding else "  [SHIELD]" if shielded else ""))

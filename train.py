@@ -23,7 +23,7 @@ model = PPO("MlpPolicy", env, verbose=1, tensorboard_log="./tb/")
 # Back to 500k (2026-09-21). With rate-limited actuators the learning curve
 # plateaus by ~300k: the 2M run on the cardiac reward sat flat (+-10%) from
 # 300k to 2M. The extra 1.5M steps were just noise, at 4x the wall time.
-model.learn(total_timesteps=500_000, progress_bar=True)
+model.learn(total_timesteps=1_000_000, progress_bar=True)
 model.save("ppo_radar")
 
 # The running mean/var must be reloaded at eval time or the policy sees
