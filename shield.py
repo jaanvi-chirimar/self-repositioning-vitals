@@ -122,6 +122,7 @@ class ChestShield:
 # RELEASE_PERSIST_S straight -- so a person turning for a second doesn't
 # set the robot off, but a person who actually turns away does.
 
+AIM_GAIN = 2.0              # omega per rad of bearing error while aiming
 HOLD_THETA_DEG = 15.0       # enter: facing the person to within this
 HOLD_PHI_DEG = 30.0         #        and within this of their chest
 HOLD_MAX_RANGE = 1.0        #        and at least this close (m)
@@ -154,8 +155,20 @@ class Hold:
         theta, aphi = abs(np.degrees(bearing)), abs(np.degrees(phi))
 
         if not self.holding:
-            if (range_ok and phi_ok and d < HOLD_MAX_RANGE
-                    and theta < HOLD_THETA_DEG and aphi < HOLD_PHI_DEG):
+            in_place = (range_ok and phi_ok and d < HOLD_MAX_RANGE
+                        and aphi < HOLD_PHI_DEG)
+            if in_place and theta >= HOLD_THETA_DEG:
+                # Right spot, wrong heading: turn in place to face the person
+                # and then hold. Turning costs nothing -- it moves the robot
+                # nowhere -- and without it the robot can sit at a good
+                # distance and aspect but a few tens of degrees off boresight
+                # and never settle. That is the common case in a cluttered
+                # room, where the policy stops wherever it fits rather than
+                # wherever it is aimed (26deg median in the bedroom layout,
+                # against 7deg in open space).
+                return np.array([0.0, np.clip(AIM_GAIN * bearing, -1.5, 1.5)],
+                                dtype=np.float32), True
+            if in_place and theta < HOLD_THETA_DEG:
                 self.holding, self.bad_for, self.held_for = True, 0.0, 0.0
                 self.snr_avg = None            # restart the reading once still
             else:

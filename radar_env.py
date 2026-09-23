@@ -87,6 +87,29 @@ OBSTACLE_PENALTY_SCALE = 200.0 * 0.316   # same per-metre weight as the person's
 # purpose -- a real 2D LiDAR gives hundreds of rays, but the policy only
 # needs enough to tell "blocked left / blocked ahead / clear right", and 8
 # keeps the observation small enough to stay trainable.
+# A furnished room, for demos and for testing transfer out of the random
+# pillar layout the policy trains on. Walls plus a bed, a nightstand and a
+# dresser, with the person sitting on the edge of the bed -- the bed is the
+# interesting part, because it is long, low and usually lies between the
+# robot and the person, so whole approach directions are simply unavailable.
+# Randomized furnished rooms, available as layout="room". NOT used in
+# training: the policy is trained on open space with random pillars only, so
+# the furnished-room results are a zero-shot transfer test into a layout it
+# has never seen, which is the situation a deployed robot is actually in.
+ROOM_SIZE_RANGE = ((3.2, 5.0), (2.8, 4.2))
+ROOM_FURNITURE = (2, 4)      # pieces per room, besides the walls
+
+BEDROOM_SIZE = (4.0, 3.2)
+BEDROOM_PERSON = (1.5, 1.75)     # sitting on the near edge of the bed
+BEDROOM_FACING_SPREAD_DEG = 70.0  # person faces into the room, +-this
+
+# A deliberately awkward start: the gap between the dresser and the two walls
+# behind it, about 40cm wide for a 34cm-wide robot. The robot begins boxed in
+# on three sides with the person out in the room, so it has to reverse out of
+# the alcove before any of the sensing geometry is reachable at all. Used with
+# layout="bedroom" as a stress case, not in training.
+TIGHT_START = (3.62, 2.98)
+
 N_LIDAR_RAYS = 8
 RAYS_PER_SECTOR = 3          # a real LiDAR is dense; each reported sector is
                              # the MINIMUM over this many rays, so a thin
@@ -94,7 +117,9 @@ RAYS_PER_SECTOR = 3          # a real LiDAR is dense; each reported sector is
 
 
 class RadarPoseEnv(Env):
-    def __init__(self, dt=0.1, max_steps=200):
+    def __init__(self, dt=0.1, max_steps=200, layout=None, tight_start=False):
+        self.layout = layout        # None = random pillars, "bedroom"/"room" = furnished
+        self.tight_start = tight_start   # bedroom only: start wedged in the alcove
         self.action_space = spaces.Box(
             low=np.array([-0.5, -1.5], dtype=np.float32),
             high=np.array([0.5, 1.5], dtype=np.float32),
@@ -128,21 +153,78 @@ class RadarPoseEnv(Env):
         self.dt = dt
         self.max_steps = max_steps
 
+    # Obstacles are ("circle", x, y, r) or ("box", cx, cy, half_w, half_h, yaw).
+    # Boxes are what a room is actually made of -- walls, a bed, a dresser --
+    # and a bed in particular is nothing like a cylinder: it is long, low and
+    # usually the thing between the robot and the person.
+
+    @staticmethod
+    def _to_box_frame(o, px, py):
+        _, cx, cy, hw, hh, yaw = o
+        c, sn = np.cos(-yaw), np.sin(-yaw)
+        dx, dy = px - cx, py - cy
+        return dx * c - dy * sn, dx * sn + dy * c, hw, hh
+
+    def _surface_distance(self, o, px, py):
+        """Distance from a point to the obstacle's surface (negative inside),
+        with the outward unit normal at the closest point."""
+        if o[0] == "circle":
+            _, cx, cy, r = o
+            dx, dy = px - cx, py - cy
+            dist = np.hypot(dx, dy)
+            if dist < 1e-9:
+                return -r, 1.0, 0.0
+            return dist - r, dx / dist, dy / dist
+        lx, ly, hw, hh = self._to_box_frame(o, px, py)
+        qx, qy = abs(lx) - hw, abs(ly) - hh
+        if qx > 0 or qy > 0:                      # outside
+            ox, oy = max(qx, 0.0), max(qy, 0.0)
+            dist = np.hypot(ox, oy)
+            nx = np.sign(lx) * (ox / dist if dist else 0.0)
+            ny = np.sign(ly) * (oy / dist if dist else 0.0)
+        else:                                     # inside: nearest face
+            dist = max(qx, qy)
+            if qx > qy:
+                nx, ny = np.sign(lx) or 1.0, 0.0
+            else:
+                nx, ny = 0.0, np.sign(ly) or 1.0
+        yaw = o[5]
+        c, sn = np.cos(yaw), np.sin(yaw)
+        return dist, nx * c - ny * sn, nx * sn + ny * c
+
     def _ray_hit(self, angle, max_range=LIDAR_MAX_RANGE):
         """Range from the robot to the first obstacle along a world-frame
         ray, or max_range if it hits nothing."""
         dx, dy = np.cos(angle), np.sin(angle)
         best = max_range
-        for ox, oy, r in self.obstacles:
-            # closest approach of the ray to the obstacle centre
-            fx, fy = ox - self.robot_x, oy - self.robot_y
-            t = fx * dx + fy * dy
-            if t <= 0:
-                continue
-            perp2 = (fx - t * dx) ** 2 + (fy - t * dy) ** 2
-            if perp2 >= r * r:
-                continue
-            hit = t - np.sqrt(r * r - perp2)
+        for o in self.obstacles:
+            if o[0] == "circle":
+                _, ox, oy, r = o
+                fx, fy = ox - self.robot_x, oy - self.robot_y
+                t = fx * dx + fy * dy
+                if t <= 0:
+                    continue
+                perp2 = (fx - t * dx) ** 2 + (fy - t * dy) ** 2
+                if perp2 >= r * r:
+                    continue
+                hit = t - np.sqrt(r * r - perp2)
+            else:
+                # slab method in the box's own frame
+                yaw = o[5]
+                c, sn = np.cos(-yaw), np.sin(-yaw)
+                lx, ly, hw, hh = self._to_box_frame(o, self.robot_x, self.robot_y)
+                rx, ry = dx * c - dy * sn, dx * sn + dy * c
+                t0, t1 = 0.0, best
+                for p, half, dr in ((lx, hw, rx), (ly, hh, ry)):
+                    if abs(dr) < 1e-9:
+                        if abs(p) > half:
+                            t1 = -1.0
+                        continue
+                    ta, tb = (-half - p) / dr, (half - p) / dr
+                    t0, t1 = max(t0, min(ta, tb)), min(t1, max(ta, tb))
+                if t1 < t0:
+                    continue
+                hit = t0
             if 0 < hit < best:
                 best = hit
         return best
@@ -162,28 +244,111 @@ class RadarPoseEnv(Env):
 
         Two passes, so being squeezed between two obstacles still resolves
         instead of oscillating."""
-        bodies = [(ox, oy, r + ROBOT_RADIUS) for ox, oy, r in self.obstacles]
-        bodies.append((self.person_x, self.person_y,
-                       PERSON_RADIUS + ROBOT_RADIUS))
-        for _ in range(2):
-            for bx, by, keep_out in bodies:
-                dx, dy = self.robot_x - bx, self.robot_y - by
-                dist = np.hypot(dx, dy)
+        keep_out = ROBOT_RADIUS
+        for _ in range(3):
+            for o in self.obstacles:
+                dist, nx, ny = self._surface_distance(o, self.robot_x, self.robot_y)
                 if dist >= keep_out:
                     continue
-                if dist < 1e-6:            # exactly on top of it: pick a direction
-                    dx, dy, dist = 1.0, 0.0, 1.0
-                self.robot_x = bx + dx / dist * keep_out
-                self.robot_y = by + dy / dist * keep_out
+                push = keep_out - dist
+                self.robot_x += nx * push
+                self.robot_y += ny * push
                 self.cmd_v = 0.0           # contact stops the drive
+            dx, dy = self.robot_x - self.person_x, self.robot_y - self.person_y
+            dist = np.hypot(dx, dy)
+            body = PERSON_RADIUS + ROBOT_RADIUS
+            if dist < body:
+                if dist < 1e-6:
+                    dx, dy, dist = 1.0, 0.0, 1.0
+                self.robot_x = self.person_x + dx / dist * body
+                self.robot_y = self.person_y + dy / dist * body
+                self.cmd_v = 0.0
 
     def _obstacle_penalty(self):
         """How far the robot has pushed into an obstacle's safe zone."""
         pen = 0.0
-        for ox, oy, r in self.obstacles:
-            gap = np.hypot(ox - self.robot_x, oy - self.robot_y) - (r + ROBOT_RADIUS + 0.1)
+        for o in self.obstacles:
+            dist = self._surface_distance(o, self.robot_x, self.robot_y)[0]
+            gap = dist - (ROBOT_RADIUS + 0.1)
             pen += OBSTACLE_PENALTY_SCALE * max(0.0, -gap)
         return pen
+
+    def _walls(self, W, H, t=0.05):
+        return [("box", W / 2, -t, W / 2, t, 0.0),
+                ("box", W / 2, H + t, W / 2, t, 0.0),
+                ("box", -t, H / 2, t, H / 2, 0.0),
+                ("box", W + t, H / 2, t, H / 2, 0.0)]
+
+    def _free(self, x, y, margin):
+        return all(self._surface_distance(o, x, y)[0] > margin for o in self.obstacles)
+
+    def _make_random_room(self):
+        """A room like the bedroom but drawn fresh: walls, a few pieces of
+        furniture at random sizes, places and angles, person and robot
+        dropped into whatever floor is left. This is what training sees --
+        the fixed bedroom is held out as a test layout."""
+        W = self.np_random.uniform(*ROOM_SIZE_RANGE[0])
+        H = self.np_random.uniform(*ROOM_SIZE_RANGE[1])
+        self.obstacles = self._walls(W, H)
+        n = int(self.np_random.integers(ROOM_FURNITURE[0], ROOM_FURNITURE[1] + 1))
+        for _ in range(n):
+            hw = self.np_random.uniform(0.2, 1.0)
+            hh = self.np_random.uniform(0.2, 0.7)
+            for _try in range(20):
+                cx = self.np_random.uniform(hw, W - hw)
+                cy = self.np_random.uniform(hh, H - hh)
+                yaw = self.np_random.uniform(-np.pi, np.pi)
+                cand = ("box", cx, cy, hw, hh, yaw)
+                if self._surface_distance(cand, W / 2, H / 2)[0] > 0.0:
+                    self.obstacles.append(cand)
+                    break
+
+        for _ in range(200):       # person somewhere with room to be approached
+            px = self.np_random.uniform(0.6, W - 0.6)
+            py = self.np_random.uniform(0.6, H - 0.6)
+            if self._free(px, py, PERSON_RADIUS + 0.55):
+                self.person_x, self.person_y = px, py
+                break
+        else:
+            self.person_x, self.person_y = W / 2, H / 2
+        self.person_phi = self.np_random.uniform(-np.pi, np.pi)
+
+        for _ in range(200):
+            x = self.np_random.uniform(0.3, W - 0.3)
+            y = self.np_random.uniform(0.3, H - 0.3)
+            if (np.hypot(x - self.person_x, y - self.person_y) > SPAWN_R_MIN
+                    and self._free(x, y, ROBOT_RADIUS + 0.15)):
+                self.robot_x, self.robot_y = x, y
+                break
+        self.robot_yaw = self.np_random.uniform(-np.pi, np.pi)
+
+    def _make_bedroom(self):
+        """Walls, bed, nightstand, dresser; person on the bed edge facing
+        into the room; robot dropped anywhere with clearance."""
+        W, H = BEDROOM_SIZE
+        self.obstacles = self._walls(W, H) + [
+            ("box", 1.1, 0.85, 1.0, 0.7, 0.0),     # bed
+            ("box", 2.45, 0.30, 0.25, 0.20, 0.0),  # nightstand
+            ("box", 3.65, 2.20, 0.25, 0.60, 0.0),  # dresser
+        ]
+        self.person_x, self.person_y = BEDROOM_PERSON
+        self.person_phi = self.np_random.uniform(
+            np.pi / 2 - np.radians(BEDROOM_FACING_SPREAD_DEG),
+            np.pi / 2 + np.radians(BEDROOM_FACING_SPREAD_DEG))
+
+        if self.tight_start:
+            self.robot_x, self.robot_y = TIGHT_START
+        else:
+            for _ in range(200):
+                x = self.np_random.uniform(0.3, W - 0.3)
+                y = self.np_random.uniform(0.3, H - 0.3)
+                if np.hypot(x - self.person_x, y - self.person_y) < SPAWN_R_MIN:
+                    continue
+                self.robot_x, self.robot_y = x, y
+                if all(self._surface_distance(o, x, y)[0] > ROBOT_RADIUS + 0.15
+                       for o in self.obstacles):
+                    break
+        self.robot_yaw = self.np_random.uniform(-np.pi, np.pi)
 
     def _true_state(self):
         """Ground truth (distance, bearing, aspect) -- for the REWARD only.
@@ -258,24 +423,29 @@ class RadarPoseEnv(Env):
         self.robot_y = self.person_y + r * np.sin(theta)
         self.robot_yaw = self.np_random.uniform(-np.pi, np.pi)
 
-        # obstacles last, so they can be kept clear of both bodies
-        self.obstacles = []
-        n = self.np_random.integers(N_OBSTACLES[0], N_OBSTACLES[1] + 1)
-        for _ in range(int(n)):
-            for _try in range(20):
-                ang = self.np_random.uniform(-np.pi, np.pi)
-                rad = self.np_random.uniform(0.8, OBSTACLE_AREA)
-                ox = self.person_x + rad * np.cos(ang)
-                oy = self.person_y + rad * np.sin(ang)
-                orad = self.np_random.uniform(*OBSTACLE_RADIUS)
-                if (np.hypot(ox - self.person_x, oy - self.person_y)
-                        < OBSTACLE_CLEAR_PERSON + orad):
-                    continue
-                if (np.hypot(ox - self.robot_x, oy - self.robot_y)
-                        < OBSTACLE_CLEAR_ROBOT + orad):
-                    continue
-                self.obstacles.append((ox, oy, orad))
-                break
+        if self.layout == "bedroom":
+            self._make_bedroom()
+        elif self.layout == "room":
+            self._make_random_room()
+        else:
+            # obstacles last, so they can be kept clear of both bodies
+            self.obstacles = []
+            n = self.np_random.integers(N_OBSTACLES[0], N_OBSTACLES[1] + 1)
+            for _ in range(int(n)):
+                for _try in range(20):
+                    ang = self.np_random.uniform(-np.pi, np.pi)
+                    rad = self.np_random.uniform(0.8, OBSTACLE_AREA)
+                    ox = self.person_x + rad * np.cos(ang)
+                    oy = self.person_y + rad * np.sin(ang)
+                    orad = self.np_random.uniform(*OBSTACLE_RADIUS)
+                    if (np.hypot(ox - self.person_x, oy - self.person_y)
+                            < OBSTACLE_CLEAR_PERSON + orad):
+                        continue
+                    if (np.hypot(ox - self.robot_x, oy - self.robot_y)
+                            < OBSTACLE_CLEAR_ROBOT + orad):
+                        continue
+                    self.obstacles.append(("circle", ox, oy, orad))
+                    break
 
         self.step_count = 0
         self.cmd_v, self.cmd_omega = 0.0, 0.0   # starts at rest

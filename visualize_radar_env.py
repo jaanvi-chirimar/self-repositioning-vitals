@@ -45,15 +45,26 @@ def make_front_marker(x, y, phi):
 
 
 def make_obstacles(obstacles):
-    """Grey pillars for the env's obstacles. They block the LiDAR and the
-    radar, so the person can go completely unseen behind one."""
+    """Draw the env's obstacles. They block the LiDAR and the radar, so the
+    person can go completely unseen behind one."""
     ids = []
-    for ox, oy, r in obstacles:
-        visual = p.createVisualShape(
-            p.GEOM_CYLINDER, radius=r, length=1.2, rgbaColor=[0.35, 0.35, 0.38, 1.0]
-        )
+    for o in obstacles:
+        if o[0] == "circle":
+            _, ox, oy, r = o
+            visual = p.createVisualShape(
+                p.GEOM_CYLINDER, radius=r, length=1.2, rgbaColor=[0.35, 0.35, 0.38, 1.0])
+            pos, orn = [ox, oy, 0.6], [0, 0, 0, 1]
+        else:
+            _, cx, cy, hw, hh, yaw = o
+            tall = min(hw, hh) < 0.1          # walls are thin and floor-to-ceiling
+            h = 1.3 if tall else 0.5
+            visual = p.createVisualShape(
+                p.GEOM_BOX, halfExtents=[hw, hh, h / 2],
+                rgbaColor=[0.55, 0.52, 0.5, 1.0] if tall else [0.45, 0.35, 0.3, 1.0])
+            pos, orn = [cx, cy, h / 2], yaw_to_quaternion(yaw + np.pi / 2)
         ids.append(p.createMultiBody(
-            baseMass=0, baseVisualShapeIndex=visual, basePosition=[ox, oy, 0.6]))
+            baseMass=0, baseVisualShapeIndex=visual, basePosition=pos,
+            baseOrientation=orn))
     return ids
 
 
@@ -74,10 +85,11 @@ def load_obs_normalizer():
     return norm
 
 
-def main(use_shield=True, turn=None):
+def main(use_shield=True, turn=None, layout=None, tight=False):
     """turn: None, "brief" (person turns 70deg for 1s at t=20s, then back)
     or "stay" (turns 90deg at t=20s and stays). Both run 40s instead of 20."""
-    env = RadarPoseEnv(max_steps=400 if turn else 200)
+    env = RadarPoseEnv(max_steps=400 if turn else 300 if tight else 200,
+                       layout=layout, tight_start=tight)
     shield = ChestShield() if use_shield else None
     hold = Hold() if use_shield else None
     model = PPO.load("ppo_radar")
@@ -144,4 +156,6 @@ def main(use_shield=True, turn=None):
 if __name__ == "__main__":
     import sys
     turn = "brief" if "--brief-turn" in sys.argv else "stay" if "--turn" in sys.argv else None
-    main(use_shield="--no-shield" not in sys.argv, turn=turn)
+    tight = "--tight" in sys.argv
+    layout = "bedroom" if ("--bedroom" in sys.argv or tight) else None
+    main(use_shield="--no-shield" not in sys.argv, turn=turn, layout=layout, tight=tight)
