@@ -152,13 +152,13 @@ def fig_geometry():
     px, py, facing = 0.0, 0.0, 90.0
 
     # sectors
-    ax.add_patch(Wedge((px, py), 1.95, facing - 45, facing + 45, color=RULES, alpha=0.13, lw=0))
+    ax.add_patch(Wedge((px, py), 1.02, facing - 45, facing + 45, color=RULES, alpha=0.13, lw=0))
     for side in (0, 180):
-        ax.add_patch(Wedge((px, py), 1.95, facing + side + 65, facing + side + 115,
+        ax.add_patch(Wedge((px, py), 2.80, facing + side + 70, facing + side + 110,
                            color=MUTED, alpha=0.11, lw=0))
-    ax.text(0.0, 1.68, "chest sector", ha="center", color=RULES, fontsize=6)
-    ax.text(-1.62, 0.18, "dead\nzone", ha="center", va="center", color=MUTED, fontsize=6)
-    ax.text(1.62, 0.18, "dead\nzone", ha="center", va="center", color=MUTED, fontsize=6)
+    ax.text(0.0, 0.88, "chest sector", ha="center", color=RULES, fontsize=6)
+    ax.text(-2.05, 0.14, "dead\nzone", ha="center", va="center", color=MUTED, fontsize=6)
+    ax.text(2.10, 0.14, "dead\nzone", ha="center", va="center", color=MUTED, fontsize=6)
 
     # person, facing up
     ax.add_patch(Circle((px, py), 0.15, facecolor="white", edgecolor=INK, lw=1.0, zorder=6))
@@ -169,7 +169,7 @@ def fig_geometry():
 
     # robot, out in the chest sector, aimed 30deg off the person
     bearing_from_person = -22.0
-    r_dist = 1.5
+    r_dist = 1.22
     rx = px + r_dist * np.cos(np.radians(bearing_from_person))
     ry = py + r_dist * np.sin(np.radians(bearing_from_person))
     los = np.degrees(np.arctan2(py - ry, px - rx))        # robot -> person
@@ -199,13 +199,13 @@ def fig_geometry():
             fontsize=7.5, color=POLICY, ha="center", va="center")
 
     # phi between the person's facing and the direction to the robot
-    ax.add_patch(Arc((px, py), 1.24, 1.24, theta1=bearing_from_person, theta2=facing,
+    ax.add_patch(Arc((px, py), 1.02, 1.02, theta1=bearing_from_person, theta2=facing,
                      edgecolor=RULES, lw=0.8, zorder=5))
     plab = np.radians((bearing_from_person + facing) / 2)
-    ax.text(0.80 * np.cos(plab), 0.80 * np.sin(plab), r"$\phi$", fontsize=7.5,
+    ax.text(0.68 * np.cos(plab), 0.68 * np.sin(plab), r"$\phi$", fontsize=7.5,
             color=RULES, ha="center", va="center")
 
-    ax.set_xlim(-1.95, 2.15); ax.set_ylim(-1.35, 1.85)
+    ax.set_xlim(-2.80, 2.95); ax.set_ylim(-1.00, 1.05)
     ax.set_aspect("equal"); ax.axis("off")
     fig.savefig(os.path.join(HERE, "geometry.pdf"))
     plt.close(fig)
@@ -397,7 +397,7 @@ def fig_teaser():
     ours, which also controls which side of the person it measures from.
     The bar under each panel is the quality the reward model predicts for
     that geometry, on the same scale as everything else in the paper."""
-    fig, axes = plt.subplots(1, 3, figsize=(COL * 2.0, 1.25))
+    fig, axes = plt.subplots(1, 3, figsize=(COL * 2.0, 1.10))
     px, py, facing = 0.0, 0.0, 90.0
 
     def person(ax, x=px, y=py, phi=facing):
@@ -453,7 +453,7 @@ def fig_teaser():
         ax.text(1.05, y0 + h / 2, f"{q:.1f}", fontsize=6.8, va="center",
                 color=INK if frac > 0.75 else MUTED)
 
-    fig.subplots_adjust(top=0.88, bottom=0.10, wspace=0.05)
+    fig.subplots_adjust(top=0.88, bottom=0.10, wspace=0.45)
     fig.text(0.5, 0.005, "predicted cardiac-band SNR at the final pose "
              "(noise floor 5.3, best achievable 13.3)",
              ha="center", fontsize=6.8, color=MUTED)
