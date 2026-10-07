@@ -35,6 +35,40 @@ LIDAR_PHI_NOISE_DEG = 10.0   # phi estimation is the unreliable one
 # std ~3-6 on a median of ~10-13 (table_a_cardiac.csv), i.e. ~2 dB.
 RADAR_SNR_FLOOR_DB = -20.0
 RADAR_SNR_NOISE_DB = 2.0
+
+# --- when a reading exists at all ----------------------------------------
+# The radar can only report cardiac_band_snr while the platform is at rest.
+# Robot vibration displaces the antenna by roughly as much as the chest
+# motion being measured (Kobayashi et al. 2023 report robot vibration in the
+# same amplitude range as the vital signs themselves, and restrict sensing to
+# stationary operation), so a reading taken while driving measures the robot,
+# not the person. The robot therefore stops, waits SETTLE_S for the chassis
+# to come to rest, and integrates for SNR_WINDOW_S; if the reading is poor it
+# moves on and tries elsewhere.
+STILL_V = 0.01               # m/s below which the drive counts as stopped
+STILL_W = 0.02               # rad/s
+SETTLE_S = 0.0               # rest this long before a reading is trusted: the
+                             # time for the chassis transient to decay once the
+                             # wheels stop. The measurement window itself
+                             # (shield.SNR_WINDOW_S) runs after this, so the
+                             # robot stops for SETTLE_S + SNR_WINDOW_S in total.
+
+# --- person movement ------------------------------------------------------
+# Random body movement (RBM) is the dominant error source in radar vital
+# sensing: the chest moves 1-12mm with respiration and only 0.2-0.5mm with
+# the heartbeat, while a shift in posture moves the torso by centimetres.
+# That energy lands in-band and raises the spectral median, which is the
+# denominator of cardiac_band_snr, so the metric degrades as
+#     Q_obs = floor + (Q - floor) / (1 + (A_rbm / A_cardiac)^2)
+# i.e. motion of the same amplitude as the heartbeat halves the usable
+# signal, and a centimetre-scale shift destroys it. A_rbm follows a slow
+# random walk (postural sway) punctuated by occasional larger shifts.
+A_CARDIAC_MM = 0.35          # heartbeat chest displacement, mid of 0.2-0.5mm
+SWAY_MM = 0.15               # steady-state postural sway amplitude
+SWAY_TAU_S = 3.0             # how fast sway wanders
+SHIFT_PROB_PER_S = 0.05      # rate of larger postural shifts
+SHIFT_MM = (2.0, 15.0)       # amplitude of one, uniformly drawn
+SHIFT_DURATION_S = (0.5, 3.0)
 SNR_OBS_SCALE = 20.0         # keeps the dB value in roughly [0, 1] for the net
 
 # --- actuator limits ------------------------------------------------------
@@ -282,11 +316,49 @@ class RadarPoseEnv(Env):
     def _free(self, x, y, margin):
         return all(self._surface_distance(o, x, y)[0] > margin for o in self.obstacles)
 
-    def _make_random_room(self):
+    def _chest_pose_exists(self):
+        """Cheap feasibility test: is there at least one spot on the chest
+        side of the person that the robot fits in and can see them from?
+
+        This is the generator's filter, so it has to be affordable per
+        episode: it samples the chest sector rather than flood-filling the
+        room, and pairs with a line-of-sight check from the robot's start,
+        which keeps both bodies in the same open region. eval/feasibility.py
+        does the full reachability version when scoring results."""
+        for k in range(16):
+            ang = self.person_phi + np.radians(-45 + 90 * k / 15)
+            for r in (MIN_CENTER_DISTANCE + 0.05, 0.75, 0.95):
+                x = self.person_x + r * np.cos(ang)
+                y = self.person_y + r * np.sin(ang)
+                if not all(self._surface_distance(o, x, y)[0] > ROBOT_RADIUS
+                           for o in self.obstacles):
+                    continue
+                x0, y0 = self.robot_x, self.robot_y
+                self.robot_x, self.robot_y = x, y
+                seen = self._person_visible(np.hypot(self.person_x - x, self.person_y - y))
+                self.robot_x, self.robot_y = x0, y0
+                if seen:
+                    return True
+        return False
+
+    def _make_random_room(self, tries=20):
         """A room like the bedroom but drawn fresh: walls, a few pieces of
         furniture at random sizes, places and angles, person and robot
-        dropped into whatever floor is left. This is what training sees --
-        the fixed bedroom is held out as a test layout."""
+        dropped into whatever floor is left.
+
+        Layouts where no chest-facing pose is reachable are redrawn rather
+        than trained on: the robot cannot succeed in them, so they teach it
+        nothing and only add noise to the return. 18% of unfiltered layouts
+        were unwinnable in this way.
+        """
+        for _ in range(tries):
+            self._draw_random_room()
+            if self._chest_pose_exists() and self._person_visible(
+                    np.hypot(self.person_x - self.robot_x,
+                             self.person_y - self.robot_y)):
+                return
+
+    def _draw_random_room(self):
         W = self.np_random.uniform(*ROOM_SIZE_RANGE[0])
         H = self.np_random.uniform(*ROOM_SIZE_RANGE[1])
         self.obstacles = self._walls(W, H)
@@ -363,6 +435,23 @@ class RadarPoseEnv(Env):
         )
         return d, b, a
 
+    def _person_motion_mm(self):
+        """Advance the person's random body movement and return its current
+        amplitude in mm. A slow random walk around SWAY_MM, with occasional
+        larger postural shifts on top."""
+        a = self.dt / SWAY_TAU_S
+        self.sway_mm = abs((1 - a) * self.sway_mm
+                           + a * SWAY_MM
+                           + self.np_random.normal(0.0, SWAY_MM * 0.5) * a ** 0.5)
+        if self.shift_left > 0.0:
+            self.shift_left -= self.dt
+            return self.sway_mm + self.shift_amp
+        if self.np_random.uniform() < SHIFT_PROB_PER_S * self.dt:
+            self.shift_amp = self.np_random.uniform(*SHIFT_MM)
+            self.shift_left = self.np_random.uniform(*SHIFT_DURATION_S)
+            return self.sway_mm + self.shift_amp
+        return self.sway_mm
+
     def _obs(self):
         """What the sensors actually report this step. Each channel can come
         back empty; the flags say which did."""
@@ -383,10 +472,18 @@ class RadarPoseEnv(Env):
         a_obs = (a + self.np_random.normal(0.0, np.radians(LIDAR_PHI_NOISE_DEG))
                  if phi_ok else 0.0)
 
-        # cardiac_band_snr in dB. Not modelled yet: the real reading needs a
-        # 10s+ window, so on hardware it lags the pose by several seconds.
-        snr_ok = visible and link_budget_db(max(d, 1e-3), np.degrees(b)) >= RADAR_SNR_FLOOR_DB
-        true_snr = 10.0 * np.log10(predicted_band_snr(max(d, 1e-3), np.degrees(b), np.degrees(a)))
+        # cardiac_band_snr in dB, and only when a reading can physically
+        # exist: line of sight, a target in the link budget, and the platform
+        # at rest long enough for the chassis to settle.
+        at_rest = self.still_for >= SETTLE_S
+        snr_ok = (visible and at_rest
+                  and link_budget_db(max(d, 1e-3), np.degrees(b)) >= RADAR_SNR_FLOOR_DB)
+        q = predicted_band_snr(max(d, 1e-3), np.degrees(b), np.degrees(a))
+        # the person's own movement raises the in-band noise the metric
+        # divides by, so it degrades the reading rather than merely offsetting it
+        rbm = self._person_motion_mm()
+        q = CARDIAC_NOISE_FLOOR + (q - CARDIAC_NOISE_FLOOR) / (1.0 + (rbm / A_CARDIAC_MM) ** 2)
+        true_snr = 10.0 * np.log10(max(q, 1e-6))
         snr_obs = (true_snr + self.np_random.normal(0.0, RADAR_SNR_NOISE_DB)
                    if snr_ok else 0.0)
 
@@ -423,7 +520,13 @@ class RadarPoseEnv(Env):
         self.robot_y = self.person_y + r * np.sin(theta)
         self.robot_yaw = self.np_random.uniform(-np.pi, np.pi)
 
-        if self.layout == "bedroom":
+        if self.layout == "empty":
+            # No obstacles at all: the LiDAR sectors all read max range and
+            # the person is never occluded. Same 17-value observation as the
+            # obstacle layouts, so one code base and one observation format
+            # covers every condition the paper reports.
+            self.obstacles = []
+        elif self.layout == "bedroom":
             self._make_bedroom()
         elif self.layout == "room":
             self._make_random_room()
@@ -449,6 +552,9 @@ class RadarPoseEnv(Env):
 
         self.step_count = 0
         self.cmd_v, self.cmd_omega = 0.0, 0.0   # starts at rest
+        self.still_for = 0.0                    # seconds at rest, for SETTLE_S
+        self.sway_mm = SWAY_MM                  # person's current RBM amplitude
+        self.shift_left = 0.0                   # seconds of postural shift left
 
         return self._obs(), {}
 
@@ -460,6 +566,11 @@ class RadarPoseEnv(Env):
         max_dw = MAX_ANGULAR_ACCEL * self.dt
         self.cmd_v += np.clip(want_v - self.cmd_v, -max_dv, max_dv)
         self.cmd_omega += np.clip(want_omega - self.cmd_omega, -max_dw, max_dw)
+
+        if abs(self.cmd_v) <= STILL_V and abs(self.cmd_omega) <= STILL_W:
+            self.still_for += self.dt
+        else:
+            self.still_for = 0.0
 
         self.robot_x += self.cmd_v * np.cos(self.robot_yaw) * self.dt
         self.robot_y += self.cmd_v * np.sin(self.robot_yaw) * self.dt

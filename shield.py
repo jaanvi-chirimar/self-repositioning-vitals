@@ -132,7 +132,11 @@ LEAVE_MAX_RANGE = 1.2       #        or farther than this...
 SNR_HOLD_MIN = 9.0          #        or averaged cardiac_band_snr below this
                             #        (13.2 peak at the chest, 9.2 at phi=45deg,
                             #        5.3 noise floor)
-SNR_WINDOW_S = 10.0         # averaging window, like the real reading
+SNR_WINDOW_S = 2.0          # integrate a reading for this long once at rest.
+                            # The robot stops, the radar becomes valid after
+                            # the chassis settles, and this is how long the
+                            # reading is averaged before it is judged: good
+                            # enough to keep, or move on and try elsewhere.
 RELEASE_PERSIST_S = 2.0     # ...for this long straight, not a blip
 
 
@@ -147,6 +151,7 @@ class Hold:
         self.bad_for = 0.0
         self.snr_avg = None
         self.held_for = 0.0
+        self.meas_for = 0.0
 
     def __call__(self, obs, action):
         """Returns (action, holding). Zero velocity while holding."""
@@ -169,24 +174,110 @@ class Hold:
                 return np.array([0.0, np.clip(AIM_GAIN * bearing, -1.5, 1.5)],
                                 dtype=np.float32), True
             if in_place and theta < HOLD_THETA_DEG:
-                self.holding, self.bad_for, self.held_for = True, 0.0, 0.0
+                self.holding, self.bad_for = True, 0.0
+                self.held_for = self.meas_for = 0.0
                 self.snr_avg = None            # restart the reading once still
             else:
                 return action, False
 
-        # holding: keep the windowed SNR up to date
+        # Holding: integrate the reading, but only while it actually exists.
+        # The radar channel is invalid until the platform has been at rest
+        # long enough to settle, so measurement time is counted separately
+        # from time spent holding.
         self.held_for += self.dt
-        snr = 10.0 ** (obs[3] * self.snr_obs_scale / 10.0) if snr_ok else 1.0
-        # plain mean until the window has filled, then a moving average
-        a = max(self.dt / SNR_WINDOW_S, self.dt / self.held_for)
-        self.snr_avg = snr if self.snr_avg is None else (1 - a) * self.snr_avg + a * snr
-        snr_ready = self.held_for >= SNR_WINDOW_S
+        if snr_ok:
+            self.meas_for += self.dt
+            snr = 10.0 ** (obs[3] * self.snr_obs_scale / 10.0)
+            a = max(self.dt / SNR_WINDOW_S, self.dt / self.meas_for)
+            self.snr_avg = snr if self.snr_avg is None else (1 - a) * self.snr_avg + a * snr
+        snr_ready = self.meas_for >= SNR_WINDOW_S
 
         pose_bad = (not range_ok or d > LEAVE_MAX_RANGE or theta > LEAVE_THETA_DEG
                     or (phi_ok and aphi > LEAVE_PHI_DEG))
-        snr_bad = snr_ready and self.snr_avg < SNR_HOLD_MIN
+        snr_bad = snr_ready and self.snr_avg is not None and self.snr_avg < SNR_HOLD_MIN
+
+        # Both a poor reading and a poor pose must persist before the robot
+        # gives up on the spot, which in practice means a second measurement
+        # window agreeing with the first. Without it, a single postural shift
+        # by the person -- which drives the metric to its noise floor for a
+        # second or two -- would send the robot away from a good pose.
         self.bad_for = self.bad_for + self.dt if (pose_bad or snr_bad) else 0.0
         if self.bad_for >= RELEASE_PERSIST_S:
             self.holding = False
             return action, False
         return np.zeros(2, dtype=np.float32), True
+
+
+# --- re-acquire -----------------------------------------------------------
+# When the person goes behind furniture every channel reads zero, and the
+# observation carries no memory, so the robot has nothing to act on and
+# stalls wherever it happens to be. In randomised furnished rooms this is
+# half of all failures: the robot settles ~1.5m out with the bed between it
+# and the person, unable to notice.
+#
+# This rule gives the stack the one piece of memory it needs: the person's
+# last known position, dead-reckoned from the robot's own commanded velocity
+# while they are out of sight. If they stay lost, it drives an arc around
+# that position -- toward whichever side the LiDAR says is clearer -- until
+# line of sight returns. Sideways is the only useful direction here: driving
+# at the last known position keeps the same obstacle in the way.
+
+LOST_S = 1.0                # unseen this long before circling
+REACQUIRE_MAX_R = 3.5       # only circle for someone lost from WITHIN lidar range
+ARC_OFFSET_DEG = 60.0       # how far around the last known position to aim
+ARC_SPEED = 0.35            # m/s
+N_SECTORS = 8               # lidar sectors in the observation, from index 9
+
+
+class Reacquire:
+    def __init__(self, dt=0.1):
+        self.dt = dt
+        self.reset()
+
+    def reset(self):
+        self.last = None        # person position in the robot's frame
+        self.lost_for = 0.0
+
+    def __call__(self, obs, action):
+        """Returns (action, searching)."""
+        d, bearing = float(obs[0]), float(obs[1])
+        range_ok = obs[4] > 0.5
+        v, w = float(obs[7]), float(obs[8])
+
+        if range_ok:
+            self.last = (d * np.cos(bearing), d * np.sin(bearing))
+            self.lost_for = 0.0
+            return action, False
+
+        self.lost_for += self.dt
+        if self.last is None:
+            return action, False                 # never seen them; nothing to go on
+
+        # dead-reckon the last known position as the robot drives
+        px, py = self.last
+        c, s = np.cos(w * self.dt), np.sin(w * self.dt)
+        px, py = px - v * self.dt, py
+        self.last = (px * c + py * s, -px * s + py * c)
+
+        if self.lost_for < LOST_S:
+            return action, False
+
+        px, py = self.last
+        r = float(np.hypot(px, py))
+        # Only a person who WAS in lidar range and then vanished has been
+        # occluded. obs[4] also drops when they are simply beyond the lidar's
+        # reach, and circling then fights the policy's own approach.
+        if r > REACQUIRE_MAX_R:
+            return action, False
+        b = float(np.arctan2(py, px))
+        # circle toward the side with more room, judged from the lidar sectors
+        sectors = np.asarray(obs[9:9 + N_SECTORS], dtype=float)
+        left = sectors[1:4].mean()               # 45-135 deg
+        right = sectors[-3:].mean()              # -135 to -45 deg
+        side = 1.0 if left >= right else -1.0
+        target = b + side * np.radians(ARC_OFFSET_DEG)
+        err = np.arctan2(np.sin(target), np.cos(target))
+        speed = ARC_SPEED if abs(err) < 0.6 and r > 0.4 else 0.0
+        return np.array([speed, np.clip(HEADING_GAIN * err, -1.5, 1.5)],
+                        dtype=np.float32), True
+

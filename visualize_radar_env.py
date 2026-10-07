@@ -8,10 +8,13 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from radar_env import RadarPoseEnv
-from shield import ChestShield, Hold
+from shield import ChestShield, Hold, Reacquire
 from geometry import PERSON_RADIUS
 
-VEC_NORMALIZE_PATH = "vec_normalize.pkl"
+# one policy per training layout; the bedroom is never trained on and is
+# driven by the policy trained on randomised rooms
+MODELS = {None: "ppo_radar_pillars", "empty": "ppo_radar_empty",
+          "room": "ppo_radar_room", "bedroom": "ppo_radar_room"}
 FRONT_OFFSET = PERSON_RADIUS + 0.15   # green chest marker, out from the person's centre
 
 
@@ -68,18 +71,18 @@ def make_obstacles(obstacles):
     return ids
 
 
-def load_obs_normalizer():
+def load_obs_normalizer(model_name):
     """Training runs under VecNormalize, so the policy learned on scaled
     observations. Replaying without the same statistics feeds it inputs on a
     different scale and the behaviour degrades silently -- no error, just a
     worse-looking robot. Load them, or say clearly that we couldn't."""
-    if not os.path.exists(VEC_NORMALIZE_PATH):
-        print(f"WARNING: {VEC_NORMALIZE_PATH} not found -- replaying on raw "
+    path = f"{model_name}_vecnorm.pkl"
+    if not os.path.exists(path):
+        print(f"WARNING: {path} not found -- replaying on raw "
               f"observations. Behaviour will not match training. Re-run "
               f"train.py to regenerate it.")
         return None
-    norm = VecNormalize.load(VEC_NORMALIZE_PATH,
-                             DummyVecEnv([lambda: RadarPoseEnv()]))
+    norm = VecNormalize.load(path, DummyVecEnv([lambda: RadarPoseEnv()]))
     norm.training = False
     norm.norm_reward = False
     return norm
@@ -90,10 +93,12 @@ def main(use_shield=True, turn=None, layout=None, tight=False):
     or "stay" (turns 90deg at t=20s and stays). Both run 40s instead of 20."""
     env = RadarPoseEnv(max_steps=400 if turn else 300 if tight else 200,
                        layout=layout, tight_start=tight)
+    model_name = MODELS[layout]
     shield = ChestShield() if use_shield else None
     hold = Hold() if use_shield else None
-    model = PPO.load("ppo_radar")
-    normalizer = load_obs_normalizer()
+    search = Reacquire() if use_shield else None
+    model = PPO.load(model_name)
+    normalizer = load_obs_normalizer(model_name)
     obs, info = env.reset()
 
     p.connect(p.GUI)
@@ -120,8 +125,9 @@ def main(use_shield=True, turn=None, layout=None, tight=False):
             env.person_y + FRONT_OFFSET * np.sin(env.person_phi), 0.8], [0, 0, 0, 1])
 
         action, _ = model.predict(policy_obs, deterministic=True)
-        shielded = holding = False
+        shielded = holding = searching = False
         if shield:
+            action, searching = search(obs, action)
             action, shielded = shield(obs, action)
             action, holding = hold(obs, action)
         obs, reward, terminated, truncated, info = env.step(action)
@@ -132,7 +138,8 @@ def main(use_shield=True, turn=None, layout=None, tight=False):
                 seen += " PERSON UNSEEN"
             print(f"step {step:3d}  d={d:.2f}  bearing={np.degrees(b):6.1f}  "
                   f"phi={np.degrees(a):7.1f}  reward={reward:7.2f}  "
-                  f"channels={seen}" + ("  [HOLD]" if holding else "  [SHIELD]" if shielded else ""))
+                  f"channels={seen}" + ("  [HOLD]" if holding else "  [SHIELD]" if shielded
+                                   else "  [SEARCH]" if searching else ""))
         step += 1
         p.resetBasePositionAndOrientation(
             robot_id,
